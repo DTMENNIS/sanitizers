@@ -1,0 +1,228 @@
+#!/bin/bash
+
+set -x
+
+# Script to configure GCE instance to run sanitizer build bots.
+
+# NOTE: If there were changes in this directory, GCE instance will try to reboot after completing the current build.
+
+USE_STAGING=${USE_STAGING:-$( [[ $(hostname) == *"-main-"* ]] && echo 0 || echo 1 )}
+SHUTDOWN_ON_ERROR=${SHUTDOWN_ON_ERROR:-0}
+
+if [[ "${USE_STAGING}" == "1" ]] ; then
+  SERVER_PORT=9994
+else
+  SERVER_PORT=9990
+fi
+
+function do_shutdown() {
+  if [[ "${SHUTDOWN_ON_ERROR}" == "1" ]] ; then
+    shutdown now
+    sleep 1000
+  else
+    echo "FAILED"
+  fi
+}
+
+BOT_DIR=/home/b
+QEMU_IMAGE_DIR=${BOT_DIR}/qemu_image
+SCRIPT_DIR=$(dirname $(readlink -f "$0"))
+FULL_HOSTNAME="$(hostname -f)"
+
+mountpoint /tmp     || mount -o nosuid -t tmpfs tmpfs /tmp || do_shutdown
+
+${SCRIPT_DIR}/install_deps.sh || do_shutdown
+
+# Optional, ingore if it fails.
+curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+bash add-google-cloud-ops-agent-repo.sh --also-install || rm -f /etc/apt/sources.list.d/google-cloud-ops-agent.list
+
+mkdir -p $BOT_DIR
+if lsblk /dev/nvme0n2 ; then
+  # Format and mount scratch drive.
+  [[ -e /dev/md0 ]] || {
+    yes | mdadm --create /dev/md0 --level=0 -q -f --raid-devices=$(ls /dev/nvme*n* | wc -l) /dev/nvme*n*
+    mkfs.xfs /dev/md0
+  }
+  mountpoint $BOT_DIR || mount -o nosuid /dev/md0 $BOT_DIR || do_shutdown
+fi
+
+# Move home to the scratch drive.
+usermod -d $BOT_DIR buildbot
+
+if [[ "$(arch)" == "x86_64" ]]; then
+  for grp in kvm cvdnetwork render; do
+    usermod -aG "$grp" buildbot || echo "No $grp group"
+  done
+  chmod 0666 /dev/kvm || echo "No /dev/kvm"
+  modprobe vhost_vsock vhost_net tun || true
+fi
+
+# Make sure .cache/clang/ModuleCache/ does not grow over time.
+rm -rf $BOT_DIR/.cache
+
+mkdir -p $BOT_DIR/.ccache
+cat <<EOF >$BOT_DIR/.ccache/ccache.conf
+max_size = 200.0G
+compression = true
+EOF
+
+chown -R buildbot:buildbot $BOT_DIR
+
+# Suppress dmesg spam "Pid <N>(qemu-aarch64) over core_pipe_limit".
+cat <<EOF >/etc/sysctl.d/999-buildbot.conf
+fs.pipe-user-pages-soft = 0
+fs.suid_dumpable = 0
+kernel.core_pipe_limit = 0
+kernel.panic_on_oops = 0
+kernel.softlockup_panic = 0
+kernel.core_pattern = |/bin/false
+EOF
+
+sysctl --system
+
+# FIXME: create_qemu_image.sh fails for unknown reasons.
+if false && [[ "$(arch)" == "x86_64" ]]; then
+  cat <<EOF >/etc/exports
+${BOT_DIR} 127.0.0.1(rw,sync,all_squash,insecure,anonuid=999,anongid=999,no_subtree_check)
+EOF
+  exportfs -rav
+
+  # Generate Debian image for QEMU bot.
+  (
+    [[ -f ${QEMU_IMAGE_DIR}/debian.img ]] && exit 0
+    set -ux
+    rm -rf $QEMU_IMAGE_DIR
+    mkdir -p $QEMU_IMAGE_DIR
+    cd $QEMU_IMAGE_DIR
+
+    SLEEP=0
+    for i in `seq 1 5`; do
+      sleep $SLEEP
+      SLEEP=$(( SLEEP + 10 ))
+      ${SCRIPT_DIR}/../hwaddress-sanitizer/create_qemu_image.sh && {
+        chown -R buildbot:buildbot $QEMU_IMAGE_DIR
+        exit 0
+      }
+    done
+    exit 1
+  ) || do_shutdown
+fi
+
+function create_worker() {
+  local WORKER_NAME="$1"
+  local SERVICE_NAME=buildbot-worker@b.service
+
+  echo "Connecting as $WORKER_NAME"
+
+  systemctl set-property $SERVICE_NAME TasksMax=100000
+  mkdir -p /etc/systemd/system/${SERVICE_NAME}.d
+  cat <<EOF >/etc/systemd/system/${SERVICE_NAME}.d/limits.conf
+[Service]
+LimitNOFILE=1048576:1048576
+LimitNICE=40
+EOF
+  
+  systemctl stop $SERVICE_NAME || true
+  while pkill buildbot-worker; do sleep 5; done;
+  rm -f ${BOT_DIR}/twistd.log ${BOT_DIR}/buildbot.tac
+
+  set +x
+  buildbot-worker create-worker -f --allow-shutdown=signal ${BOT_DIR} lab.llvm.org:$SERVER_PORT \
+    "$WORKER_NAME" \
+    "$(gcloud storage cat gs://sanitizer-buildbot/buildbot_password)"
+  set -x
+
+  mkdir -p /var/lib/buildbot/workers/b
+  ln -fs $BOT_DIR/buildbot.tac /var/lib/buildbot/workers/b/
+
+  echo "Vitaly Buka <vitalybuka@google.com>" > ${BOT_DIR}/info/admin
+
+  {
+    echo 'See "Info" step of each build and https://github.com/google/sanitizers/wiki/SanitizerBotReproduceBuild'
+    echo "Host: ${FULL_HOSTNAME}"
+  } > ${BOT_DIR}/info/host
+
+  chown -R buildbot:buildbot $BOT_DIR
+
+  systemctl daemon-reload
+  systemctl start $SERVICE_NAME
+  systemctl status $SERVICE_NAME
+  sleep 30
+  cat ${BOT_DIR}/twistd.log
+  grep "worker is ready" $BOT_DIR/twistd.log
+}
+
+function script_needs_update() {
+  git -C "${SCRIPT_DIR}" fetch && ! git -C "${SCRIPT_DIR}" diff --exit-code HEAD @{u} -- .
+}
+
+function shutdown_maybe() {
+  if ! script_needs_update ; then
+    [[ $(cat /proc/uptime | grep -oP "^\d+") -lt $((3600*72)) ]] && return
+    (w -h | grep .) && return
+    w -h
+    cat /proc/uptime
+  fi
+  echo "Rebooting..."
+  #while pkill -SIGHUP buildbot-worker; do sleep 5; done;
+  do_shutdown
+}
+
+function write_lock() {
+  local LOCK_FILE="$1"
+  local ONLY_SELF="${2:-0}"
+
+  local GEN
+  GEN=$(gcloud storage objects describe "${LOCK_FILE}" --format="value(generation)" 2>/dev/null || echo 0)
+
+  local LOCK_DATA="{}"
+  if [[ "${GEN}" != "0" ]]; then
+    LOCK_DATA=$(gcloud storage cat "${LOCK_FILE}" 2>/dev/null) || return 1
+  fi
+  local FILTER='(.expires_at // 0) < now'
+  [[ "${ONLY_SELF}" == "1" ]] && FILTER='.owner == $h'
+  echo "${LOCK_DATA}" | jq -e --arg h "${FULL_HOSTNAME}" "${FILTER}" || return 1
+
+  echo "{\"owner\":\"${FULL_HOSTNAME}\",\"expires_at\":$(($(date +%s) + 900))}" | \
+    gcloud storage cp --if-generation-match="${GEN}" - "${LOCK_FILE}"
+}
+
+function claim_worker() {
+  local WORKER_NAME="$1"
+  local ONLY_SELF="${2:-0}"
+  local LOCK_FILE="gs://sanitizer-buildbot-out/slot-${SERVER_PORT}-${WORKER_NAME}.lock"
+
+  write_lock "${LOCK_FILE}" "${ONLY_SELF}" || return 1
+
+  create_worker "$WORKER_NAME" || return 2
+
+  while sleep 300; do
+    write_lock "${LOCK_FILE}" 1 || do_shutdown
+    shutdown_maybe
+  done
+}
+
+if [[ "$(arch)" == "x86_64" ]]; then
+  if [[ "${USE_STAGING}" == "1" ]]; then
+    BOTS="2"
+  else
+    BOTS="1 2 3 4 5 6"
+  fi
+else
+  BOTS="7 8 9 10 11 12"
+fi
+BOTS=$(echo "$BOTS" | tr ' ' '\n' | shuf)
+while true ; do
+  sleep $((30 + $RANDOM % 150))
+  shutdown_maybe
+
+  for ONLY_SELF in 1 0 ; do
+    for W in $BOTS ; do
+      claim_worker "sanitizer-buildbot${W}" "${ONLY_SELF}"
+    done
+  done
+
+  # No unclaimed workers?
+  do_shutdown
+done

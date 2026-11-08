@@ -2,10 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,30 +20,33 @@ import (
 )
 
 var (
-	bots = []struct {
-		name, url string
-	}{
-		{"Clang (FYI)", ""},
-		{"x86_64-debian-fast", "http://lab.llvm.org:8011/builders/clang-x86_64-debian-fast"},
-		{"Chromium", ""},
-		{"(FYI) Clang Linux ToT", "https://build.chromium.org/p/chromium.fyi/builders/ClangToTLinux%20tester"},
-		{"CFI Linux", "https://build.chromium.org/p/chromium.fyi/builders/CFI%20Linux"},
-		{"CFI Linux ToT", "https://build.chromium.org/p/chromium.fyi/builders/CFI%20Linux%20ToT"},
-		{"CFI Linux CF", "https://build.chromium.org/p/chromium.fyi/builders/CFI%20Linux%20CF"},
-		{"Sanitizers", ""},
-		{"windows", "http://lab.llvm.org:8011/builders/sanitizer-windows"},
-		{"x86_64-linux", "http://lab.llvm.org:8011/builders/sanitizer-x86_64-linux"},
-		{"x86_64-linux-bootstrap", "http://lab.llvm.org:8011/builders/sanitizer-x86_64-linux-bootstrap"},
-		{"x86_64-linux-fast", "http://lab.llvm.org:8011/builders/sanitizer-x86_64-linux-fast"},
-		{"x86_64-linux-autoconf", "http://lab.llvm.org:8011/builders/sanitizer-x86_64-linux-autoconf"},
-		{"ppc64be-linux", "http://lab.llvm.org:8011/builders/sanitizer-ppc64be-linux"},
-		{"ppc64le-linux", "http://lab.llvm.org:8011/builders/sanitizer-ppc64le-linux"},
-		{"LibFuzzer (x86_64-linux)", ""},
-		{"sanitizer", "http://lab.llvm.org:8011/builders/sanitizer-x86_64-linux-fuzzer"},
-		{"chromium-asan", "https://build.chromium.org/p/chromium.fyi/builders/Libfuzzer%20Upload%20Linux%20ASan"},
-		{"chromium-asan-dbg", "https://build.chromium.org/p/chromium.fyi/builders/Libfuzzer%20Upload%20Linux%20ASan%20Debug"},
-		{"chromium-msan", "https://build.chromium.org/p/chromium.fyi/builders/Libfuzzer%20Upload%20Linux%20MSan"},
-		{"chromium-ubsan", "https://build.chromium.org/p/chromium.fyi/builders/Libfuzzer%20Upload%20Linux%20UBSan"},
+	cacheDir    = flag.String("cache_dir", filepath.Join(os.TempDir(), "sanitizer-dashboard"), "Directory for caches and git checkout")
+	fetchLimit  = flag.Int("fetch", 10, "Number of builds to fetch per bot")
+	jobs        = flag.Int("jobs", 2, "Maximum number of concurrent buildbot requests")
+	renderLimit = flag.Int("render", 300, "Number of commits to render")
+	staging     = flag.Bool("staging", false, "Use staging buildbot instead of main buildbot")
+
+	sem chan struct{}
+
+	bots = []string{
+		"sanitizer-windows",
+		"sanitizer-x86_64-linux",
+		"sanitizer-x86_64-linux-bootstrap-asan",
+		"sanitizer-x86_64-linux-bootstrap-cfi",
+		"sanitizer-x86_64-linux-bootstrap-msan",
+		"sanitizer-x86_64-linux-bootstrap-ubsan",
+		"sanitizer-x86_64-linux-fast",
+		"sanitizer-x86_64-linux-android",
+		"sanitizer-x86_64-linux-qemu",
+		"sanitizer-aarch64-linux",
+		"sanitizer-aarch64-linux-bootstrap-asan",
+		"sanitizer-aarch64-linux-bootstrap-cfi",
+		"sanitizer-aarch64-linux-bootstrap-hwasan",
+		"sanitizer-aarch64-linux-bootstrap-msan",
+		"sanitizer-aarch64-linux-bootstrap-ubsan",
+		"sanitizer-ppc64le-linux",
+		"sanitizer-x86_64-linux-fuzzer",
+		"sanitizer-aarch64-linux-fuzzer",
 	}
 )
 
@@ -78,28 +84,299 @@ func findSubtags(n *html.Node, tagName string) []*html.Node {
 }
 
 type status struct {
-	buildUrl string
-	rev      int64
-	success  int
+	Number   int    `json:"number"`
+	BuildUrl string `json:"build_url"`
+	Success  int    `json:"success"`
+	Revision string `json:"revision"`
+	Pending  bool   `json:"-"`
 }
 
 type statusLine struct {
-	date     string
-	statuses []status
+	Lastbuild  time.Time `json:"lastbuild"`
+	Statuses   []status  `json:"statuses"`
+	BuilderUrl string    `json:"builder_url"`
+	IsStaging  bool      `json:"is_staging"`
 }
 
-func GetStatus(buildUrl string) (statusLine, error) {
-	if buildUrl == "" {
-		return *new(statusLine), nil
+func countBuilds(cache map[string]statusLine) int {
+	n := 0
+	for _, sl := range cache {
+		n += len(sl.Statuses)
+	}
+	return n
+}
+
+func filterCompleted(sl statusLine) statusLine {
+	completed := make([]status, 0, len(sl.Statuses))
+	for _, s := range sl.Statuses {
+		if !s.Pending {
+			completed = append(completed, s)
+		}
+	}
+	sl.Statuses = completed
+	return sl
+}
+
+func loadCache(path string) map[string]statusLine {
+	cache := make(map[string]statusLine)
+	data, err := os.ReadFile(path)
+	if err == nil {
+		_ = json.Unmarshal(data, &cache)
+	}
+	fmt.Fprintf(os.Stderr, "Loaded %d builds from cache in %s\n", countBuilds(cache), path)
+	return cache
+}
+
+func saveCache(path string, cache map[string]statusLine) {
+	data, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(path, data, 0666); err == nil {
+		fmt.Fprintf(os.Stderr, "Saved %d builds to cache in %s\n", countBuilds(cache), path)
+	}
+}
+
+type commitInfo struct {
+	Hash  string
+	Time  string
+	Title string
+}
+
+func fetchCommits(repoPath string) ([]commitInfo, map[string]int) {
+	cloneRepo := func() error {
+		_ = os.RemoveAll(repoPath)
+		cmd := exec.Command("git", "clone", "--bare", "--no-tags", "--filter=tree:0", "--depth=10000", "--single-branch", "-b", "main", "https://github.com/llvm/llvm-project.git", repoPath)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "git clone failed: %v: %s\n", err, out)
+			return err
+		}
+		return nil
 	}
 
+	if _, err := os.Stat(filepath.Join(repoPath, "HEAD")); err == nil {
+		cmd := exec.Command("git", "--git-dir="+repoPath, "fetch", "-u", "--no-tags", "--filter=tree:0", "origin", "+main:main")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "git fetch failed: %v: %s\n", err, out)
+			if cloneRepo() != nil {
+				return nil, nil
+			}
+		}
+	} else if cloneRepo() != nil {
+		return nil, nil
+	}
+	out, err := exec.Command("git", "--git-dir="+repoPath, "log", "--format=%H\t%ct\t%s", "main").Output()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "git log failed: %v\n", err)
+		if cloneRepo() != nil {
+			return nil, nil
+		}
+		out, err = exec.Command("git", "--git-dir="+repoPath, "log", "--format=%H\t%ct\t%s", "main").Output()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "git log failed after clone: %v\n", err)
+			return nil, nil
+		}
+	}
+	loc, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load TZ: %v\n", err)
+		loc = time.UTC
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	var list []commitInfo
+	commits := make(map[string]int, len(lines))
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		h := parts[0]
+		commitTime := ""
+		if ts, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
+			commitTime = time.Unix(ts, 0).In(loc).Format("01-02 15:04")
+		}
+		title := ""
+		if len(parts) > 2 {
+			title = parts[2]
+		}
+		commits[h] = len(list)
+		list = append(list, commitInfo{Hash: h, Time: commitTime, Title: title})
+	}
+	topCommit := ""
+	if len(list) > 0 {
+		topCommit = list[0].Hash
+	}
+	fmt.Fprintf(os.Stderr, "Loaded %d commits from %s (top: %s)\n", len(list), repoPath, topCommit)
+	return list, commits
+}
+
+func mergeStatusLine(fresh, cached statusLine) statusLine {
+	if fresh.Lastbuild.IsZero() {
+		return cached
+	}
+	if cached.Lastbuild.IsZero() {
+		return fresh
+	}
+	if fresh.BuilderUrl != cached.BuilderUrl {
+		if cached.Lastbuild.After(fresh.Lastbuild) {
+			return cached
+		}
+		return fresh
+	}
+	if cached.Lastbuild.After(fresh.Lastbuild) {
+		fresh, cached = cached, fresh
+	}
+	seen := make(map[string]int, len(fresh.Statuses))
+	merged := make([]status, 0, len(fresh.Statuses)+len(cached.Statuses))
+	for _, s := range fresh.Statuses {
+		seen[s.BuildUrl] = len(merged)
+		merged = append(merged, s)
+	}
+	for _, s := range cached.Statuses {
+		if idx, ok := seen[s.BuildUrl]; !ok {
+			seen[s.BuildUrl] = len(merged)
+			merged = append(merged, s)
+		} else if merged[idx].Revision == "" && s.Revision != "" {
+			merged[idx].Revision = s.Revision
+		}
+	}
+	sort.SliceStable(merged, func(i, j int) bool {
+		return merged[i].Number > merged[j].Number
+	})
+	if len(merged) > 1000 {
+		merged = merged[:1000]
+	}
+	fresh.Statuses = merged
+	return fresh
+}
+
+type Builds struct {
+	Builds []struct {
+		Builderid  int  `json:"builderid"`
+		Buildid    int  `json:"buildid"`
+		Complete   bool `json:"complete"`
+		CompleteAt int  `json:"complete_at"`
+		Number     int  `json:"number"`
+		Results    int  `json:"results"`
+		Properties struct {
+			Revision []string `json:"revision"`
+		} `json:"properties"`
+	} `json:"builds"`
+}
+
+func QueryJSONBuilds(url string) (*Builds, error) {
+	if sem != nil {
+		sem <- struct{}{}
+		defer func() { <-sem }()
+	}
+	url = strings.Replace(url, "http://lab.llvm.org/", "https://lab.llvm.org/", 1)
+	fmt.Fprintf(os.Stderr, "Querying %s\n", url)
 	var resp *http.Response
 	var err error
 	for i := 0; i < 3; i++ {
 		client := http.Client{
 			Timeout: time.Duration(120 * time.Second),
 		}
-		resp, err = client.Get(buildUrl + "?numbuilds=31")
+		req, reqErr := http.NewRequest("GET", url, nil)
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		req.Header.Set("User-Agent", "sanitizer-dashboard/1.0")
+		resp, err = client.Do(req)
+		if err == nil {
+			break
+		}
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	var builds Builds
+	defer resp.Body.Close()
+	bodyBytes, _ := ioutil.ReadAll(resp.Body)
+	err = json.Unmarshal(bodyBytes, &builds)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to parse JS: %s\n", err.Error())
+		return nil, err
+	}
+	sort.SliceStable(builds.Builds, func(i, j int) bool {
+		return builds.Builds[i].Number > builds.Builds[j].Number
+	})
+	return &builds, nil
+}
+
+func GetStatusFromJson(builderUrl string) (statusLine, error) {
+	baseUrl, err := url.Parse(builderUrl)
+	if err != nil {
+		return *new(statusLine), err
+	}
+
+	builds, err := QueryJSONBuilds(fmt.Sprintf("%s/builds?limit=%d&order=-number&property=revision", builderUrl, *fetchLimit))
+	if err != nil {
+		return *new(statusLine), err
+	}
+
+	var sl statusLine = statusLine{
+		BuilderUrl: builderUrl,
+	}
+	for _, b := range builds.Builds {
+		builder, _ := url.Parse(fmt.Sprintf("../../../#/builders/%d", b.Builderid))
+		sl.BuilderUrl = baseUrl.ResolveReference(builder).String()
+		if len(b.Properties.Revision) == 0 || b.Properties.Revision[0] == "" {
+			continue
+		}
+		revision := b.Properties.Revision[0]
+		build, _ := url.Parse(fmt.Sprintf("../../../#/builders/%d/builds/%d", b.Builderid, b.Number))
+		thisUrl := baseUrl.ResolveReference(build).String()
+
+		if !b.Complete {
+			sl.Statuses = append(sl.Statuses, status{
+				Number:   b.Number,
+				BuildUrl: thisUrl,
+				Revision: revision,
+				Pending:  true,
+			})
+			continue
+		}
+
+		time := time.Unix(int64(b.CompleteAt), 0)
+		if sl.Lastbuild.Before(time) {
+			sl.Lastbuild = time
+		}
+
+		success := 0
+		if b.Results < 2 {
+			success = 1
+		} else if b.Results == 2 {
+			success = -1
+		}
+		sl.Statuses = append(sl.Statuses, status{b.Number, thisUrl, success, revision, false})
+	}
+	return sl, nil
+}
+
+func GetStatus(builderUrl string) (statusLine, error) {
+	if builderUrl == "" {
+		return *new(statusLine), nil
+	}
+
+	if strings.Contains(builderUrl, "lab.llvm.org") {
+		return GetStatusFromJson(builderUrl)
+	}
+
+	qUrl := fmt.Sprintf("%s?numbuilds=%d", builderUrl, *fetchLimit)
+	fmt.Fprintf(os.Stderr, "Querying %s\n", qUrl)
+	var resp *http.Response
+	var err error
+	for i := 0; i < 3; i++ {
+		client := http.Client{
+			Timeout: time.Duration(120 * time.Second),
+		}
+		resp, err = client.Get(qUrl)
 		if err == nil {
 			break
 		}
@@ -109,7 +386,7 @@ func GetStatus(buildUrl string) (statusLine, error) {
 		return *new(statusLine), err
 	}
 
-	baseUrl, err := url.Parse(buildUrl)
+	baseUrl, err := url.Parse(builderUrl)
 	if err != nil {
 		return *new(statusLine), err
 	}
@@ -120,40 +397,60 @@ func GetStatus(buildUrl string) (statusLine, error) {
 		if n.Type == html.ElementNode && n.Data == "table" && class(n) == "info" {
 			for c := n.FirstChild; c != nil; c = c.NextSibling {
 				if c.Type == html.ElementNode && c.Data == "tbody" {
-					date := ""
+					lastbuild := time.Time{}
 					var statuses []status
+					isLuci := false
 					for i, c := range findSubtags(c, "tr") {
 						// ignore header row
 						if i == 0 {
 							// Does this look like the right table?
 							h := findSubtag(c, "th")
-							if h != nil && h.FirstChild != nil && h.FirstChild.Data == "Time" {
-								continue
+							if h != nil && h.FirstChild != nil {
+								if h.FirstChild.Data == "Time" {
+									continue
+								} else if h.FirstChild.Data == "Create time" {
+									isLuci = true
+									continue
+								}
 							}
 							return *new(statusLine)
 						}
 
 						success := 0
 						buildUrl := ""
-						var rev int64 = 0
 
 						for i, c := range findSubtags(c, "td") {
-							if i == 0 && date == "" {
-								date = c.FirstChild.Data
+							if ((!isLuci && i == 0) || (isLuci && i == 1)) && lastbuild.IsZero() {
+								// LUCI has slightly different layout/formatting than buildbot
+								if c.FirstChild.Data == "span" {
+									strtime, err := strconv.ParseInt(attr(c.FirstChild, "data-timestamp"), 10, 64)
+									if err == nil {
+										lastbuild = time.Unix(strtime/1000, 0)
+									}
+								} else {
+									loc, err := time.LoadLocation("America/Los_Angeles")
+									if err == nil {
+										parsedtime, err := time.ParseInLocation("Jan 2 15:04", c.FirstChild.Data, loc)
+										if err == nil {
+											lastbuild = parsedtime.AddDate(time.Now().Year(), 0, 0)
+										} else {
+											fmt.Fprintf(os.Stderr, "Failed to parse: %s\n", err.Error())
+										}
+									} else {
+										fmt.Fprintf(os.Stderr, "Failed to load TZ: %s\n", err.Error())
+									}
+								}
 							}
-							if i == 1 {
-								rev, _ = strconv.ParseInt(c.FirstChild.Data, 10, 0)
-							}
-							if i == 2 {
-								if class(c) == "success" {
+							if (!isLuci && i == 2) || (isLuci && i == 4) {
+								classC := class(c)
+								if strings.Contains(strings.ToLower(classC), "success") {
 									success = 1
 								}
-								if class(c) == "failure" {
+								if strings.Contains(strings.ToLower(classC), "failure") {
 									success = -1
 								}
-
 							}
-							if i == 3 {
+							if (!isLuci && i == 3) || (isLuci && i == 5) {
 								relUrl, err := url.Parse(attr(findSubtag(c, "a"), "href"))
 								if err == nil {
 									buildUrl = baseUrl.ResolveReference(relUrl).String()
@@ -161,14 +458,14 @@ func GetStatus(buildUrl string) (statusLine, error) {
 							}
 						}
 
-						statuses = append(statuses, status{buildUrl, rev, success})
+						statuses = append(statuses, status{0, buildUrl, success, "", false})
 					}
-					return statusLine{date, statuses}
+					return statusLine{lastbuild, statuses, builderUrl, false}
 				}
 			}
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			if s := f(c); s.date != "" {
+			if s := f(c); !s.Lastbuild.IsZero() {
 				return s
 			}
 		}
@@ -178,117 +475,96 @@ func GetStatus(buildUrl string) (statusLine, error) {
 	return f(doc), err
 }
 
-type OssFuzzProject struct {
-	Name    string `json:"name"`
-	BuildId string `json:"build_id"`
-}
-
-type OssFuzzStatus struct {
-	Projects    []OssFuzzProject
-	Successes   []OssFuzzProject
-	Failures    []OssFuzzProject
-	Unstable    []OssFuzzProject
-	LastUpdated string `json:"last_updated"`
-}
-
-type ByName []OssFuzzProject
-
-func (a ByName) Len() int           { return len(a) }
-func (a ByName) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByName) Less(i, j int) bool { return a[i].Name < a[j].Name }
-
-func GetOssFuzzStatusString() string {
-	header := "<h2>OSS-Fuzz</h2>"
-
-	var resp *http.Response
-	var err error
-	stausUrl := "https://oss-fuzz-build-logs.storage.googleapis.com"
-	for i := 0; i < 3; i++ {
-		client := http.Client{
-			Timeout: time.Duration(120 * time.Second),
-		}
-		resp, err = client.Get(stausUrl + "/status.json")
-		if err == nil {
-			break
-		}
-	}
-
-	if err != nil {
-		return fmt.Sprintf("%s<p><span class=other>%v</span></p>", header, err)
-	}
-
-	var status OssFuzzStatus
-	jsonBytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Sprintf("%s<p><span class=other>%v</span></p>", header, err)
-	}
-
-	err = json.Unmarshal(jsonBytes, &status)
-	if err != nil {
-		return fmt.Sprintf("%s<p><span class=other>%v</span></p>", header, err)
-	}
-
-	htmlStatuses := ""
-	sort.Sort(ByName(status.Projects))
-	for i := range status.Projects {
-		class := "success"
-		for j := range status.Unstable {
-			if status.Unstable[j].Name == status.Projects[i].Name {
-				class = "warning"
-			}
-		}
-		for j := range status.Failures {
-			if status.Failures[j].Name == status.Projects[i].Name {
-				class = "error"
-			}
-		}
-		htmlStatuses += fmt.Sprintf(
-			"<span class='%s'><a href='%s/log-%s.txt'>%s</a>&nbsp;</span> ",
-			class, stausUrl, status.Projects[i].BuildId, status.Projects[i].Name)
-	}
-
-	return fmt.Sprintf("%s %s", header, htmlStatuses)
-}
-
 func main() {
+	flag.Parse()
+	if *jobs > 0 {
+		sem = make(chan struct{}, *jobs)
+	}
+	if err := os.MkdirAll(*cacheDir, 0777); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create cache dir %s: %v\n", *cacheDir, err)
+	}
+
 	fmt.Println(`
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"
    "http://www.w3.org/TR/html4/loose.dtd">
 <html>
 <head>
 <title>dashboard</title>
-<link href="https://fonts.googleapis.com/css?family=Open+Sans|Inconsolata" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css?family=Inconsolata" rel="stylesheet">
 <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
 <meta http-equiv="refresh" content="43200">
 <style type="text/css">
-body { color: white; font-family: 'Open Sans', sans-serif; font-size: 24px; }
-a {	color: inherit; text-decoration: none; }
+html, body { height: 100%; margin: 0; overflow: hidden; }
+body { color: white; font-family: 'Inconsolata', monospace; font-size: 24px; display: flex; flex-direction: column; justify-content: flex-end; box-sizing: border-box; padding: 8px; }
+p { margin: 4px 0 0 0; font-size: 12px; color: #666; }
+a { color: inherit; text-decoration: none; }
 h2 { margin: .25em 0 0 0; font-size: 110%; }
-.error { color: red; }
-.error.symbol::before { content: "\2717"; font-family: 'Inconsolata', monospace; font-weight: bold;}
-.success { color: green; }
-.success.symbol::before { content: "\2713"; font-family: 'Inconsolata', monospace; font-weight: bold;}
-.warning { color: yellow; }
-.warning.symbol::before {content: "?"; font-family: 'Inconsolata', monospace; font-weight: bold;}
-.other { color: #c6c; }
-.other.symbol::before { content: "~"; font-family: 'Inconsolata', monospace; font-weight: bold;}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.missing { color: #666; }
+.error { color: #ff3355; }
+.success { color: #00e676; }
+.warning { color: #ffd600; }
+.other { color: #e040fb; }
+.error:not(.missing).symbol::before, .success:not(.missing).symbol::before, .other:not(.missing).symbol::before { content: ""; display: inline-block; position: relative; top: -2px; width: 0.8ch; height: 0.8ch; background: currentColor; border-radius: 50%; }
+.warning:not(.missing).symbol::before { content: ""; display: inline-block; position: relative; top: -2px; box-sizing: border-box; width: 0.8ch; height: 0.8ch; border: 2px solid #444; border-top-color: #ffd600; border-radius: 50%; animation: spin 3.2s linear infinite; }
+.missing.symbol::before { content: "\00b7"; font-weight: bold;}
+td.timeline > .missing:nth-child(even) { opacity: 0.5; }
+.symbol { display: inline-block; width: 1ch; text-align: center; }
+.symbol:has(.commit) { vertical-align: bottom; }
+.commit { display: inline-block; writing-mode: sideways-lr; white-space: nowrap; font-size: 12px; line-height: 12px; padding-bottom: 4px; }
+.c0 { color: #4285f4; }
+.c1 { color: #ea4335; }
+.c2 { color: #fbbc05; }
+.c3 { color: #34a853; }
 table {
    width: 100%;
+   flex-shrink: 0;
 }
+td { white-space: nowrap; padding-right: 0.6em; font-size: 18px; text-align: right; }
+td.timeline { width: 100%; max-width: 0; overflow: hidden; padding-right: 0; font-size: 24px; text-align: left; }
 </style>
-<script src="https://ajax.googleapis.com/ajax/libs/jquery/3.1.1/jquery.min.js"></script>
 <script>
+const updateTimes = () => document.querySelectorAll('[data-ts]').forEach(
+  el => el.textContent = new Date(+el.dataset.ts).toLocaleString('sv-SE')
+);
+window.addEventListener('DOMContentLoaded', updateTimes);
 // Reload without flickering.
-$(function() { 
-  setTimeout(function() {
-    $.get('', function(data) { $(document.body).html(data); });
-  },60000); 
+setInterval(async () => {
+  const r = await fetch('', {cache: 'no-store'});
+  if (r.ok) {
+    document.body.innerHTML = new DOMParser().parseFromString(await r.text(), 'text/html').body.innerHTML;
+    updateTimes();
+  }
+}, 60000);
+document.addEventListener('mouseover', (e) => {
+  const el = e.target.closest('td.timeline > .missing');
+  if (!el || el.title) return;
+  const a = document.querySelectorAll('tr:first-child td.timeline > a')[[...el.parentNode.children].indexOf(el)];
+  if (a) el.title = a.title;
+});
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('td.timeline > .missing');
+  if (!el) return;
+  const a = document.querySelectorAll('tr:first-child td.timeline > a')[[...el.parentNode.children].indexOf(el)];
+  if (a) a.click();
 });
 </script>
 </head>
 <body bgcolor=black>
 <table>
 `)
+
+	master := "buildbot"
+	cacheFile := "cache.json"
+	if *staging {
+		master = "staging"
+		cacheFile = "cache-staging.json"
+	}
+	cachePath := filepath.Join(*cacheDir, cacheFile)
+	cache := loadCache(cachePath)
 
 	statuses := make([]statusLine, len(bots))
 	errors := make([]error, len(bots))
@@ -300,72 +576,134 @@ $(function() {
 	status_ch := make(chan status_ret)
 	for i := range bots {
 		go func(i int) {
-			s, err := GetStatus(bots[i].url)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-			}
+			url := fmt.Sprintf("http://lab.llvm.org/%s/api/v2/builders/%s", master, bots[i])
+			s, err := GetStatus(url)
+			s.IsStaging = *staging
 			status_ch <- status_ret{i, s, err}
 		}(i)
 	}
 
-	maxStatuses := 0
 	for range bots {
 		status := <-status_ch
+		cached, hasCached := cache[bots[status.n]]
+		if hasCached && cached.IsStaging != *staging {
+			delete(cache, bots[status.n])
+			hasCached = false
+		}
+		if hasCached {
+			status.line = mergeStatusLine(status.line, cached)
+			if !status.line.Lastbuild.IsZero() {
+				status.err = nil
+			}
+		}
+		if !status.line.Lastbuild.IsZero() {
+			cache[bots[status.n]] = filterCompleted(status.line)
+		}
 		statuses[status.n] = status.line
 		errors[status.n] = status.err
-		if maxStatuses < len(status.line.statuses) {
-			maxStatuses = len(status.line.statuses)
-		}
 	}
-	ossfuzz_ch := make(chan string)
-	go func() { ossfuzz_ch <- GetOssFuzzStatusString() }()
+	saveCache(cachePath, cache)
+	commitList, commits := fetchCommits(filepath.Join(*cacheDir, "llvm-project.git"))
 
+	maxDist := *renderLimit
+	if len(commitList) < maxDist {
+		maxDist = len(commitList)
+	}
+
+	tr := func(s string) string {
+		return fmt.Sprintf("<tr>%s</tr>", s)
+	}
+
+	td := func(attrs string, s string) string {
+		return fmt.Sprintf("<td %s>%s</td>", attrs, s)
+	}
+
+	span := func(class string, s string) string {
+		return fmt.Sprintf("<span class=\"%s\">%s</span>", class, s)
+	}
+
+	a := func(url string, text string) string {
+		return fmt.Sprintf("<a href=\"%s\" target=_top>%s</a>", url, text)
+	}
+
+	if maxDist > 0 {
+		googleColors := []string{"c0", "c1", "c2", "c0", "c3", "c1"}
+		var header strings.Builder
+		for d := 0; d < maxDist; d++ {
+			c := commitList[d]
+			short := c.Hash
+			if len(short) > 7 {
+				short = short[:7]
+			}
+			escapedTitle := html.EscapeString(c.Title)
+			label := c.Time + " " + short + " " + escapedTitle
+			commitUrl := "https://github.com/llvm/llvm-project/commit/" + c.Hash
+			color := googleColors[(6-(len(commitList)-d)%6)%6]
+			fmt.Fprintf(&header, "<a href=\"%s\" target=_top title=\"%s %s (-%d) %s\">%s</a>",
+				commitUrl, c.Time, c.Hash, d, escapedTitle, span("symbol", span("commit "+color, label)))
+		}
+		r := td("", "") + td("", "") + td("class=\"timeline\"", header.String())
+		fmt.Println(tr(r))
+	}
+
+	shortBotName := strings.NewReplacer("sanitizer-", "", "-linux", "", "-bootstrap", "")
 	for i := range bots {
-		if bots[i].url == "" {
-			fmt.Println(fmt.Sprintf("<tr><td colspan=%d><h2>", maxStatuses+3))
-			fmt.Println(bots[i].name)
-			fmt.Println("</h2></td></tr>")
+		if !statuses[i].Lastbuild.IsZero() && time.Since(statuses[i].Lastbuild) > 7*24*time.Hour {
 			continue
 		}
 
-		tr := func(s string) string {
-			return fmt.Sprintf("<tr>%s</tr>", s)
-		}
-
-		td := func(attrs string, s string) string {
-			return fmt.Sprintf("<td %s>%s</td>", attrs, s)
-		}
-
-		span := func(class string, s string) string {
-			return fmt.Sprintf("<span class=\"%s\">%s</span>", class, s)
-		}
-
-		a := func(url string, text string) string {
-			return fmt.Sprintf("<a href=\"%s\" target=_top>%s</a>", url, text)
-		}
-
-		class := func(status int) string {
-			if status == 1 {
+		class := func(s status) string {
+			if s.Pending {
+				return "warning"
+			}
+			if s.Success == 1 {
 				return "success"
-			} else if status == -1 {
+			} else if s.Success == -1 {
 				return "error"
 			}
 			return "other"
 		}
 
-		r := ""
-		date := "??:??"
-		if statuses[i].date != "" {
-			date = statuses[i].date[len(statuses[i].date)-5:]
+		byDist := make(map[int]status, len(statuses[i].Statuses))
+		for _, s := range statuses[i].Statuses {
+			d, ok := commits[s.Revision]
+			if !ok {
+				continue
+			}
+			if _, exists := byDist[d]; !exists {
+				byDist[d] = s
+			}
 		}
-		r += td("", date+"&nbsp;")
 
-		style := class(0)
-		if len(statuses[i].statuses) > 0 {
-			style = class(statuses[i].statuses[0].success)
+		style := class(status{})
+		bestDist := len(commitList)
+		lkgb := ""
+		bestLkgbDist := len(commitList)
+		for d, s := range byDist {
+			if !s.Pending {
+				if d < bestDist {
+					bestDist = d
+					style = class(s)
+				}
+				if s.Success == 1 && d < bestLkgbDist {
+					bestLkgbDist = d
+					lkgb = s.BuildUrl
+				}
+			}
 		}
 
-		r += td("", a(bots[i].url, span(style, bots[i].name)))
+		r := td("", fmt.Sprintf("<a href=\"%s\" target=_top title=\"%s\">%s</a>",
+			statuses[i].BuilderUrl, bots[i], span(style, shortBotName.Replace(bots[i]))))
+
+		if lkgb != "" {
+			medal := "&#129351;"
+			if statuses[i].IsStaging {
+				medal = "&#129352;"
+			}
+			r += td("", a(lkgb, medal))
+		} else {
+			r += td("", "")
+		}
 
 		if errors[i] != nil {
 			errStr := errors[i].Error()
@@ -373,29 +711,27 @@ $(function() {
 			if trim != -1 {
 				errStr = errStr[trim+1:]
 			}
-			r += td(fmt.Sprintf("colspan=%d", maxStatuses+1), span(class(0), errStr))
-		} else if statuses[i].date != "" {
-			for j := range statuses[i].statuses[:len(statuses[i].statuses)-1] {
-				s := statuses[i].statuses[j]
-				style := class(s.success)
-				// TODO: Make use of revisions
-				// text = fmt.Sprintf("%d", s.rev - statuses[i].statuses[j+1].rev)
-				r += td("", a(s.buildUrl, span(style+" symbol", "")))
+			r += td("class=\"timeline\"", span(class(status{}), errStr))
+		} else if !statuses[i].Lastbuild.IsZero() {
+			var timeline strings.Builder
+			style := ""
+			for d := 0; d < maxDist; d++ {
+				if s, ok := byDist[d]; ok {
+					if !s.Pending {
+						style = class(s)
+					}
+					fmt.Fprintf(&timeline, "<a href=\"%s\" target=_top title=\"%s %s (-%d)\">%s</a>",
+						s.BuildUrl, commitList[d].Time, s.Revision, d, span(class(s)+" symbol", ""))
+				} else {
+					timeline.WriteString(span("missing "+style+" symbol", ""))
+				}
 			}
+			r += td("class=\"timeline\"", timeline.String())
 		}
 		fmt.Println(tr(r))
 	}
 	fmt.Println(`</table>`)
-	fmt.Println(<-ossfuzz_ch)
-	fmt.Println(`<p><font size=".8em">go/dynamic-tools-dashboard, `)
-	tz, err := time.LoadLocation("America/Los_Angeles")
-	if err != nil {
-		fmt.Println("err: ", err.Error())
-	}
-	fmt.Println(time.Now().In(tz).Format("2006-Jan-2 15:04:05 MST"))
-	fmt.Println(`
-</font></p>
-</body>
-</html>
-`)
+	fmt.Printf("<p><a href=\"http://go/dynamic-tools-dashboard\" target=_top>go/dynamic-tools-dashboard</a>, generated: <span data-ts=\"%d\"></span></p>\n", time.Now().UnixMilli())
+	fmt.Println(`</body>
+</html>`)
 }
